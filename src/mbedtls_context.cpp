@@ -38,6 +38,7 @@
 #include "sockpp/connector.h"
 #include "sockpp/exception.h"
 #include <mbedtls/ctr_drbg.h>
+#include <mbedtls/debug.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/error.h>
 #include <mbedtls/net_sockets.h>
@@ -71,10 +72,6 @@
 #endif
 
 
-// TODO: Better logging(?)
-#define log(FMT,...) fprintf(stderr, "TLS: " FMT "\n", ## __VA_ARGS__)
-
-
 namespace sockpp {
     using namespace std;
 
@@ -82,22 +79,19 @@ namespace sockpp {
     static std::string read_system_root_certs();
 
 
-    static int log_mbed_ret(int ret, const char *fn) {
-        if (ret != 0) {
-            char msg[100];
-            mbedtls_strerror(ret, msg, sizeof(msg));
-            log("mbedtls error -0x%04X from %s: %s", -ret, fn, msg);
-        }
-        return ret;
-    }
-
-
     // Simple RAII helper for mbedTLS cert struct
     struct mbedtls_context::cert : public mbedtls_x509_crt
     {
-    public:
         cert()  {mbedtls_x509_crt_init(this);}
         ~cert() {mbedtls_x509_crt_free(this);}
+    };
+
+
+    // Simple RAII helper for mbedTLS cert struct
+    struct mbedtls_context::key : public mbedtls_pk_context
+    {
+        key()  {mbedtls_pk_init(this);}
+        ~key() {mbedtls_pk_free(this);}
     };
 
 
@@ -113,6 +107,22 @@ namespace sockpp {
         bool open_ = false;
 
     public:
+
+        #define log(LEVEL, FMT,...) do { \
+            auto ssl = &ssl_; \
+            MBEDTLS_SSL_DEBUG_MSG(LEVEL, ("SockPP: " FMT, ## __VA_ARGS__)); \
+        }while(0)
+
+
+        int log_mbed_ret(int ret, const char *fn) {
+            if (ret != 0) {
+                char msg[100];
+                mbedtls_strerror(ret, msg, sizeof(msg));
+                log(1, "mbedtls error -0x%04X from %s: %s", -ret, fn, msg);
+            }
+            return ret;
+        }
+
 
         mbedtls_socket(unique_ptr<stream_socket> base,
                        mbedtls_context &context,
@@ -143,11 +153,10 @@ namespace sockpp {
             setup_bio(blocking);
 
             // Run the TLS handshake:
+            open_ = true;
             int status;
             do {
-                open_ = true;  // temporarily, so BIO methods won't fail
                 status = mbedtls_ssl_handshake(&ssl_);
-                open_ = false;
             } while (status == MBEDTLS_ERR_SSL_WANT_READ || status == MBEDTLS_ERR_SSL_WANT_WRITE
                             || status == MBEDTLS_ERR_SSL_CRYPTO_IN_PROGRESS);
             if (check_mbed_setup(status, "mbedtls_ssl_handshake") != 0)
@@ -158,12 +167,11 @@ namespace sockpp {
                                   && !(verify_flags & MBEDTLS_X509_BADCERT_SKIP_VERIFY)) {
                 char vrfy_buf[512];
                 mbedtls_x509_crt_verify_info(vrfy_buf, sizeof( vrfy_buf ), "", verify_flags);
-                log("Cert verify failed: %s", vrfy_buf );
+                log(1, "Cert verify failed: %s", vrfy_buf );
                 reset();
                 clear(MBEDTLS_ERR_X509_CERT_VERIFY_FAILED);
                 return;
             }
-            open_ = true;
         }
 
 
@@ -229,8 +237,12 @@ namespace sockpp {
 
         string peer_certificate() override {
             auto cert = mbedtls_ssl_get_peer_cert(&ssl_);
-            if (!cert)
-                return "";
+            if (!cert) {
+                // This should only happen in a failed handshake scenario, or if there
+                // was no cert to begin with
+                return context_.get_peer_certificate();
+            }
+            
             return string((const char*)cert->raw.p, cert->raw.len);
         }
 
@@ -318,13 +330,13 @@ namespace sockpp {
 
 
         // Translates mbedTLS error code to POSIX (errno)
-        static int translate_mbed_err(int mbedErr) {
+        int translate_mbed_err(int mbedErr) {
             switch (mbedErr) {
                 case MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY:
                     return 0;
                 case MBEDTLS_ERR_SSL_WANT_READ:
                 case MBEDTLS_ERR_SSL_WANT_WRITE:
-                    log(">>> mbedtls_socket returning EWOULDBLOCK");
+                    log(3, "mbedtls_socket returning EWOULDBLOCK");
                     return EWOULDBLOCK;
                 case MBEDTLS_ERR_NET_CONN_RESET:
                     return ECONNRESET;
@@ -341,9 +353,24 @@ namespace sockpp {
         int check_mbed_setup(int ret, const char *fn) {
             if (ret != 0) {
                 log_mbed_ret(ret, fn);
+                int err = translate_mbed_err(ret);
+                if (ret == MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE)
+                    err = mbedtls_context::FATAL_ERROR_ALERT_BASE - ssl_.in_msg[1];
+                log(1, "---closing mbedtls_socket with error (mbed status -0x%x, last_error %d) ---", -ret, err);
                 reset(); // marks me as closed/invalid
-                clear(ret); // sets last_error
+                clear(err); // sets last_error
+
+                // Signal we're done by shutting down the socket's write stream. That lets the
+                // client finish sending any data and receive our error alert. Wait until the
+                // client closes, by reading data until we get 0 bytes, then finally close.
+                stream().shutdown(SHUT_WR);
+                stream().read_timeout(2000ms);
+                char buf[100];
+                while (stream().read(buf, sizeof(buf)) > 0)
+                    ;
                 stream().close();
+                log(2, "--- closed mbedtls_socket ---");
+
                 open_ = false;
             }
             return ret;
@@ -361,7 +388,7 @@ namespace sockpp {
 
 
         // Handles an mbedTLS read/write return value, converting it to an ioresult.
-        static inline ioresult ioresult_from_mbed(int mbedResult) {
+        inline ioresult ioresult_from_mbed(int mbedResult) {
             if (mbedResult < 0)
                 return ioresult(0, translate_mbed_err(mbedResult));
             else
@@ -371,7 +398,7 @@ namespace sockpp {
 
         // Translates ioresult to an mbedTLS error code to return from a BIO function.
         template <bool reading>
-        static int bio_return_value(ioresult result) {
+        int bio_return_value(ioresult result) {
             if (result.error == 0)
                 return (int)result.count;
             switch (result.error) {
@@ -390,7 +417,7 @@ namespace sockpp {
                 case WSAEINTR:
                 case WSAEWOULDBLOCK:
 #endif
-                    log(">>> BIO returning MBEDTLS_ERR_SSL_WANT_%s", reading ?"READ":"WRITE");
+                    log(3, ">>> BIO returning MBEDTLS_ERR_SSL_WANT_%s", reading ?"READ":"WRITE");
                     return reading ? MBEDTLS_ERR_SSL_WANT_READ
                                    : MBEDTLS_ERR_SSL_WANT_WRITE;
                 default:
@@ -403,12 +430,23 @@ namespace sockpp {
                                    : MBEDTLS_ERR_NET_SEND_FAILED;
             }
         }
-
-
     };
+
+    
+    #undef log
 
 
 #pragma mark - CONTEXT:
+
+
+    static int log_mbed_ret(int ret, const char *fn) {
+        if (ret != 0) {
+            char msg[100];
+            mbedtls_strerror(ret, msg, sizeof(msg));
+            fprintf(stderr, "TLS: mbedtls error -0x%04X from %s: %s\n", -ret, fn, msg);
+        }
+        return ret;
+    }
 
 
     static tls_context *s_default_context = nullptr;
@@ -432,6 +470,25 @@ namespace sockpp {
         static once_flag once;
         call_once(once, []() {
             mbedtls_entropy_init( &s_entropy );
+
+            #if defined(_MSC_VER)
+            #if !WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+            auto uwp_entropy_poll = [](void *data, unsigned char *output, size_t len,
+                                       size_t *olen) -> int
+            {
+                NTSTATUS status = BCryptGenRandom(NULL, output, (ULONG)len, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+                if (status < 0) {
+                    return MBEDTLS_ERR_ENTROPY_SOURCE_FAILED;
+                }
+
+                *olen = len;
+                return 0;
+            };
+            mbedtls_entropy_add_source(&s_entropy, uwp_entropy_poll, NULL, 32,
+                                       MBEDTLS_ENTROPY_SOURCE_STRONG);
+            #endif
+            #endif
+        
             mbedtls_ctr_drbg_init( &s_random_ctx );
             int ret = mbedtls_ctr_drbg_seed(&s_random_ctx, mbedtls_entropy_func, &s_entropy,
                                             (const uint8_t *)k_entropy_personalization,
@@ -445,19 +502,27 @@ namespace sockpp {
     }
 
 
-    unique_ptr<mbedtls_context::cert> mbedtls_context::parse_cert(const std::string &cert_data) {
+    unique_ptr<mbedtls_context::cert> mbedtls_context::parse_cert(const std::string &cert_data, bool partialOk) {
         unique_ptr<cert> c(new cert);
         mbedtls_x509_crt_init(c.get());
         int ret = mbedtls_x509_crt_parse(c.get(),
                                          (const uint8_t*)cert_data.data(), cert_data.size() + 1);
-        if (ret != 0)
-            throw sys_error(ret);   //FIXME: Not an errno; use different exception?
+        if (ret != 0) {
+	        if(ret < 0 || !partialOk) {
+		        log_mbed_ret(ret, "mbedtls_x509_crt_parse");
+	        	if(ret > 0) {
+	        		ret = MBEDTLS_ERR_X509_CERT_VERIFY_FAILED;
+	        	}
+
+				throw sys_error(ret);
+	        }
+        }
         return c;
     }
 
 
     void mbedtls_context::set_root_certs(const std::string &cert_data) {
-        root_certs_ = parse_cert(cert_data);
+        root_certs_ = parse_cert(cert_data, true);
         mbedtls_ssl_conf_ca_chain(ssl_config_.get(), root_certs_.get(), nullptr);
     }
 
@@ -469,7 +534,7 @@ namespace sockpp {
             // One-time initialization:
             string certsPEM = read_system_root_certs();
             if (!certsPEM.empty())
-                s_system_root_certs = parse_cert(certsPEM).release();
+                s_system_root_certs = parse_cert(certsPEM, true).release();
         });
         return s_system_root_certs;
     }
@@ -491,6 +556,14 @@ namespace sockpp {
         auto roots = get_system_root_certs();
         if (roots)
             mbedtls_ssl_conf_ca_chain(ssl_config_.get(), roots, nullptr);
+
+        // Install a custom verification callback that will call my verify_callback():
+        mbedtls_ssl_conf_verify(
+                        ssl_config_.get(),
+                        [](void *ctx, mbedtls_x509_crt *crt, int depth, uint32_t *flags) {
+                            return ((mbedtls_context*)ctx)->verify_callback(crt,depth,flags);
+                        },
+                        this);
     }
 
 
@@ -499,52 +572,124 @@ namespace sockpp {
     }
 
 
-    void mbedtls_context::allow_invalid_peer_certs(bool allow) {
-        int authMode = (allow ? MBEDTLS_SSL_VERIFY_OPTIONAL : MBEDTLS_SSL_VERIFY_REQUIRED);
+    int mbedtls_context::trusted_cert_callback(void *context,
+                                               mbedtls_x509_crt const *child,
+                                               mbedtls_x509_crt **candidates)
+    {
+        if (!root_cert_locator_)
+            return -1;
+        string certData((const char*)child->raw.p, child->raw.len);
+        string rootData;
+        if (!root_cert_locator_(certData, rootData))
+            return -1;//TEMP
+        if (rootData.empty()) {
+            *candidates = nullptr;
+        } else {
+            // (can't use parse_cert() here because its return value uses RAII and will free itself)
+            auto root = (mbedtls_x509_crt*)malloc(sizeof(mbedtls_x509_crt));
+            mbedtls_x509_crt_init(root);
+            int err = mbedtls_x509_crt_parse(root,
+                                             (const uint8_t*)rootData.data(), rootData.size() + 1);
+            if (err != 0) {
+                mbedtls_x509_crt_free(root);
+                free(root);
+                return err;
+            }
+            *candidates = root;
+        }
+        return 0;
+    }
+
+
+    void mbedtls_context::set_root_cert_locator(RootCertLocator loc) {
+        root_cert_locator_ = loc;
+        mbedtls_x509_crt_ca_cb_t callback = nullptr;
+        if (loc) {
+            callback = [](void *ctx, mbedtls_x509_crt const *child, mbedtls_x509_crt **cand) {
+                return ((mbedtls_context*)ctx)->trusted_cert_callback(ctx, child, cand);
+            };
+            mbedtls_ssl_conf_ca_cb(ssl_config_.get(), callback, this);
+        } else {
+            // Resetting this automatically clears the callback
+            auto roots = get_system_root_certs();
+            if (roots)
+                mbedtls_ssl_conf_ca_chain(ssl_config_.get(), roots, nullptr);
+        }
+    }
+
+
+    void mbedtls_context::set_logger(int threshold, Logger logger) {
+        if (!logger_) {
+            mbedtls_ssl_conf_dbg(ssl_config_.get(), [](void *ctx, int level, const char *file, int line,
+                                                       const char *msg) {
+                auto &logger = ((mbedtls_context*)ctx)->logger_;
+                if (logger)
+                    logger(level, file, line, msg);
+            }, this);
+        }
+        logger_ = logger;
+        mbedtls_debug_set_threshold(threshold);
+    }
+
+
+    void mbedtls_context::require_peer_cert(role_t forRole, bool require, bool sendCAList) {
+        if (forRole != role())
+            return;
+        int authMode = (require ? MBEDTLS_SSL_VERIFY_REQUIRED : MBEDTLS_SSL_VERIFY_OPTIONAL);
         mbedtls_ssl_conf_authmode(ssl_config_.get(), authMode);
+
+    	if(role() == SERVER) {
+    		mbedtls_ssl_conf_cert_req_ca_list(ssl_config_.get(), sendCAList
+				? MBEDTLS_SSL_CERT_REQ_CA_LIST_ENABLED
+				: MBEDTLS_SSL_CERT_REQ_CA_LIST_DISABLED);
+		}
     }
 
 
     void mbedtls_context::allow_only_certificate(const std::string &cert_data) {
-        pinned_cert_.reset();
         if (cert_data.empty()) {
-            mbedtls_ssl_conf_verify(ssl_config_.get(), nullptr, nullptr);
+            pinned_cert_.reset();
         } else {
-            pinned_cert_ = parse_cert(cert_data);
-            // Install a custom verification callback:
-            mbedtls_ssl_conf_verify(
-                            ssl_config_.get(),
-                            [](void *ctx, mbedtls_x509_crt *crt, int depth, uint32_t *flags) {
-                                return ((mbedtls_context*)ctx)->verify_callback(crt,depth,flags);
-                            },
-                            this);
+            pinned_cert_ = parse_cert(cert_data, false);
         }
     }
 
 
     void mbedtls_context::allow_only_certificate(mbedtls_x509_crt *certificate) {
-        pinned_cert_.reset();
+        string cert_data;
         if (certificate) {
-            string cert_data((const char*)certificate->raw.p, certificate->raw.len);
-            allow_only_certificate(cert_data);
-        } else {
-            mbedtls_ssl_conf_verify(ssl_config_.get(), nullptr, nullptr);
+            cert_data = string((const char*)certificate->raw.p, certificate->raw.len);
         }
+        allow_only_certificate(cert_data);
     }
 
 
     // callback from mbedTLS cert validation (see above)
     int mbedtls_context::verify_callback(mbedtls_x509_crt *crt, int depth, uint32_t *flags) {
-        if (depth == 0) {
-            if (crt->raw.len == pinned_cert_->raw.len
-                        && 0 == memcmp(crt->raw.p, pinned_cert_->raw.p, crt->raw.len)) {
-                // The cert matches our pinned cert, so mark it as trusted.
-                // (It might still be invalid if it's expired or revoked...)
-                *flags &= ~(MBEDTLS_X509_BADCERT_NOT_TRUSTED | MBEDTLS_X509_BADCERT_CN_MISMATCH);
-            } else {
-                // If cert doesn't match pinned cert, mark it as untrusted.
-                *flags |= MBEDTLS_X509_BADCERT_OTHER;
+        if (depth != 0) {
+            if(pinned_cert_) {
+                // We only care that the end cert matches, clear all other errors
+                *flags = 0;
             }
+            
+            return 0;
+        }
+
+        int status = -1;
+        received_cert_data_ = string((const char *)crt->raw.p, crt->raw.len);
+        
+        if (pinned_cert_) {
+            status = (crt->raw.len == pinned_cert_->raw.len
+                      && 0 == memcmp(crt->raw.p, pinned_cert_->raw.p, crt->raw.len));
+        } else if (auto &callback = get_auth_callback(); callback) {
+            string certData((const char*)crt->raw.p, crt->raw.len);
+            status = callback(certData);
+        }
+        
+        if (status > 0) {
+            *flags &= ~(MBEDTLS_X509_BADCERT_NOT_TRUSTED | MBEDTLS_X509_BADCERT_CN_MISMATCH);
+        } else if (status == 0) {
+            *flags |= MBEDTLS_X509_BADCERT_OTHER;
         }
         return 0;
     }
@@ -553,18 +698,26 @@ namespace sockpp {
     void mbedtls_context::set_identity(const std::string &certificate_data,
                                        const std::string &private_key_data)
     {
-        abort();
+        auto ident_cert = parse_cert(certificate_data, false);
+
+        unique_ptr<key> ident_key(new key);
+        int err = mbedtls_pk_parse_key(ident_key.get(),
+                                       (const uint8_t*) private_key_data.data(),
+                                       private_key_data.size(), NULL, 0);
+        if( err != 0 ) {
+            log_mbed_ret(err, "mbedtls_pk_parse_key");
+            throw sys_error(err);
+        }
+
+        set_identity(ident_cert.get(), ident_key.get());
+        identity_cert_ = move(ident_cert);
+        identity_key_  = move(ident_key);
     }
 
-    void mbedtls_context::set_identity_files(const std::string &certificate_file,
-                                             const std::string &private_key_file,
-                                             const std::string &private_key_password)
+
+    void mbedtls_context::set_identity(mbedtls_x509_crt *certificate,
+                                       mbedtls_pk_context *private_key)
     {
-        abort();
-    }
-
-
-    void mbedtls_context::set_identity(mbedtls_x509_crt *certificate, mbedtls_pk_context *private_key) {
         mbedtls_ssl_conf_own_cert(ssl_config_.get(), certificate, private_key);
     }
 
@@ -579,7 +732,7 @@ namespace sockpp {
                                                         const std::string &peer_name)
     {
         assert(socketRole == role());
-        return unique_ptr<tls_socket>(new mbedtls_socket(move(socket), *this, peer_name));
+        return make_unique<mbedtls_socket>(move(socket), *this, peer_name);
     }
 
 
@@ -588,11 +741,11 @@ namespace sockpp {
 
     // mbedTLS does not have built-in support for reading the OS's trusted root certs.
 
-#if TARGET_OS_OSX
-
+#ifdef __APPLE__
     // Read system root CA certs on macOS.
     // (Sadly, SecTrustCopyAnchorCertificates() is not available on iOS)
     static string read_system_root_certs() {
+    #if TARGET_OS_OSX
         CFArrayRef roots;
         OSStatus err = SecTrustCopyAnchorCertificates(&roots);
         if (err)
@@ -605,14 +758,49 @@ namespace sockpp {
         string pem((const char*)CFDataGetBytePtr(pemData), CFDataGetLength(pemData));
         CFRelease(pemData);
         return pem;
+    #else
+        // fallback -- no certs
+        return "";
+    #endif
     }
 
-#elif !defined(_WIN32)
+#elif defined(_WIN32)
+    // Windows:
+    static string read_system_root_certs() {
+        PCCERT_CONTEXT pContext = nullptr;
+    	HCERTSTORE hStore = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, NULL,
+			CERT_SYSTEM_STORE_CURRENT_USER, "ROOT");
+        if(hStore == nullptr) {
+            return "";
+        }
 
+        stringstream certs;
+        while ((pContext = CertEnumCertificatesInStore(hStore, pContext))) {
+            DWORD pCertPEMSize = 0;
+            if (!CryptBinaryToStringA(pContext->pbCertEncoded, pContext->cbCertEncoded, CRYPT_STRING_BASE64HEADER, NULL, &pCertPEMSize)) {
+                return "";
+            }
+            LPSTR pCertPEM = (LPSTR)malloc(pCertPEMSize);
+            if (!CryptBinaryToStringA(pContext->pbCertEncoded, pContext->cbCertEncoded, CRYPT_STRING_BASE64HEADER, pCertPEM, &pCertPEMSize)) {
+                return "";
+            }
+            certs.write(pCertPEM, pCertPEMSize);
+            free(pCertPEM);
+        }
+
+        CertCloseStore(hStore, CERT_CLOSE_STORE_FORCE_FLAG);
+        return certs.str();
+    }
+
+#else
     // Read system root CA certs on Linux using OpenSSL's cert directory
     static string read_system_root_certs() {
+#ifdef __ANDROID__
+        static constexpr const char* CERTS_DIR  = "/system/etc/security/cacerts/";
+#else
         static constexpr const char* CERTS_DIR  = "/etc/ssl/certs/";
         static constexpr const char* CERTS_FILE = "ca-certificates.crt";
+#endif
 
         stringstream certs;
         char buf[1024];
@@ -634,18 +822,23 @@ namespace sockpp {
 
         struct stat s;
         if (stat(CERTS_DIR, &s) == 0 && S_ISDIR(s.st_mode)) {
+#ifndef __ANDROID__
             string certs_file = string(CERTS_DIR) + CERTS_FILE;
             if (stat(certs_file.c_str(), &s) == 0) {
                 // If there is a file containing all the certs, just read it:
                 read_file(certs_file);
-            } else {
+            } else
+#endif
+            {
                 // Otherwise concatenate all the certs found in the dir:
                 auto dir = opendir(CERTS_DIR);
                 if (dir) {
                     struct dirent *ent;
                     while (nullptr != (ent = readdir(dir))) {
+#ifndef __ANDROID__
                         if (fnmatch("?*.pem", ent->d_name, FNM_PERIOD) == 0
                                     || fnmatch("?*.crt", ent->d_name, FNM_PERIOD) == 0)
+#endif
                             read_file(string(CERTS_DIR) + ent->d_name);
                     }
                     closedir(dir);
@@ -655,22 +848,6 @@ namespace sockpp {
         return certs.str();
     }
 
-#else
-    static string read_system_root_certs() {
-	    PCCERT_CONTEXT pContext = nullptr;
-	    HCERTSTORE hStore = CertOpenSystemStore(NULL, "ROOT");
-		if(hStore == nullptr) {
-			return "";
-		}
-
-		stringstream certs;
-		while ((pContext = CertEnumCertificatesInStore(hStore, pContext))) {
-			certs.write((const char*)pContext->pbCertEncoded, pContext->cbCertEncoded);
-		}
-
-		CertCloseStore(hStore, CERT_CLOSE_STORE_FORCE_FLAG);
-		return certs.str();
-    }
 #endif
 
 

@@ -61,11 +61,11 @@ std::string sys_error::error_str(int err)
 	buf[0] = '\x0';
 
 	#if defined(_WIN32)
-		FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+		FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
 			NULL, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
 			buf, sizeof(buf), NULL);
     #else
-    	#ifdef _GNU_SOURCE
+    	#if defined(__GLIBC__)
 			auto s = strerror_r(err, buf, sizeof(buf));
 			return s ? std::string(s) : std::string();
         #else
@@ -78,7 +78,11 @@ std::string sys_error::error_str(int err)
 /////////////////////////////////////////////////////////////////////////////
 
 getaddrinfo_error::getaddrinfo_error(int err, const string& hostname)
+#if defined(_WIN32)
+	: runtime_error(gai_strerrorA(err)), error_(err), hostname_(hostname)
+#else
     : runtime_error(gai_strerror(err)), error_(err), hostname_(hostname)
+#endif
 {
 }
 

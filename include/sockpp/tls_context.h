@@ -48,6 +48,7 @@
 #define __sockpp_tls_context_h
 
 #include "sockpp/platform.h"
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -98,12 +99,18 @@ namespace sockpp {
         virtual void set_root_certs(const std::string &certData) =0;
 
         /**
-         * Allows connections to peers whose X.509 certificates are not valid.
-         * **If enabled, you take responsibility for validating the certificate yourself!**
-         * @param allow Pass true to allow invalid certs to be used, false to disallow
-         *              (default is false.)
+         * Configures whether the peer is required to present a valid certificate, for a connection
+         * using the given role.
+         * * For the CLIENT role the default is true; if you change to false, you take
+         *   responsibility for validating the server certificate yourself!
+         * * For the SERVER role the default is false; you can change it to true to require
+         *   client certificate authentication.
+         * @param role  The role you are configuring this setting for
+         * @param require Pass true to require a valid peer certificate, false to not require.
+         * @param sendCAList Pass true to automatically generate a list of trusted CAs for
+         *                   the received client cert, if possible (only applies when role == SERVER)
          */
-        virtual void allow_invalid_peer_certs(bool allow) =0;
+        virtual void require_peer_cert(role_t role, bool require, bool sendCAList) =0;
 
         /**
          * Requires that the peer have the exact certificate given.
@@ -114,12 +121,30 @@ namespace sockpp {
          */
         virtual void allow_only_certificate(const std::string &certData) =0;
 
+        /**
+         * A function that can be called during the TLS handshake to examine the peer's certificate.
+         * @param certData  The certificate's data, in DER encoding.
+         * @return  True to accept the cert, false to reject it and abort the connection.
+         */
+        using auth_callback = std::function<bool(const std::string &certData)>;
+
+        /**
+         * Registers a callback to be invoked during the TLS handshake, that can examine
+         * the peer cert (if any) and accept or reject it.
+         */
+        void set_auth_callback(auth_callback cb) {
+            auth_callback_ = std::move(cb);
+        }
+
+        /**
+         * Returns the authentication callback, if any.
+         */
+        const auth_callback& get_auth_callback() const {
+            return auth_callback_;
+        }
+
         virtual void set_identity(const std::string &certificate_data,
                                   const std::string &private_key_data) =0;
-
-        virtual void set_identity_files(const std::string &certificate_file,
-                                        const std::string &private_key_file,
-                                        const std::string &private_key_password) =0;
 
         /**
          * Creates a new \ref tls_socket instance that wraps the given connector socket.
@@ -151,6 +176,7 @@ namespace sockpp {
         tls_context(const tls_context&) =delete;
 
         mutable int status_ =0;
+        std::function<bool(const std::string&)> auth_callback_;
     };
 
 }
