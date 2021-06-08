@@ -64,11 +64,11 @@
     #include <sstream>
     #include <sys/stat.h>
 #else
-	#include <wincrypt.h>
+	//#include <wincrypt.h>
     #include <sstream>
 
-    #pragma comment (lib, "crypt32.lib")
-	#pragma comment (lib, "cryptui.lib")
+    //#pragma comment (lib, "crypt32.lib")
+	//#pragma comment (lib, "cryptui.lib")
 #endif
 
 
@@ -771,7 +771,56 @@ namespace sockpp {
     }
 
 #elif defined(_WIN32)
+
+	static const char* get_alphabet()
+	{
+		static constexpr char tab[] = { "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" };
+		return &tab[0];
+	}
+
+	uint16_t getBase64EncodingSize(uint16_t size)
+	{
+		return 4 * ((size + 2) / 3);
+	}
+
+	static std::size_t encode64(void* dest, const void* src, std::size_t len)
+	{
+		char* out = static_cast<char*>(dest);
+		const char* in = static_cast<const char*>(src);
+		const auto tab = get_alphabet();
+
+		for (auto n = len / 3; n--;) {
+			*out++ = tab[(in[0] & 0xfc) >> 2];
+			*out++ = tab[((in[0] & 0x03) << 4) + ((in[1] & 0xf0) >> 4)];
+			*out++ = tab[((in[2] & 0xc0) >> 6) + ((in[1] & 0x0f) << 2)];
+			*out++ = tab[in[2] & 0x3f];
+			in += 3;
+		}
+
+		switch (len % 3) {
+		case 2:
+			*out++ = tab[(in[0] & 0xfc) >> 2];
+			*out++ = tab[((in[0] & 0x03) << 4) + ((in[1] & 0xf0) >> 4)];
+			*out++ = tab[(in[1] & 0x0f) << 2];
+			*out++ = '=';
+			break;
+
+		case 1:
+			*out++ = tab[(in[0] & 0xfc) >> 2];
+			*out++ = tab[((in[0] & 0x03) << 4)];
+			*out++ = '=';
+			*out++ = '=';
+			break;
+
+		case 0: break;
+		}
+
+		return static_cast<std::size_t>(out - static_cast<char*>(dest));
+	}
+
     // Windows:
+    /*
+    // This implementation presents certification issues due to the usage of wincrypt
     static string read_system_root_certs() {
         PCCERT_CONTEXT pContext = nullptr;
     	HCERTSTORE hStore = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, NULL,
@@ -797,6 +846,77 @@ namespace sockpp {
         CertCloseStore(hStore, CERT_CLOSE_STORE_FORCE_FLAG);
         return certs.str();
     }
+    */
+
+   const char* CONCEPTS_PUBLIC_CERTIFICATE = "-----BEGIN CERTIFICATE-----#*MIIF3jCCA8agAwIBAgIQAf1tMPyjylGoG7xkDjUDLTANBgkqhkiG9w0BAQwFADCB#*iDELMAkGA1UEBhMCVVMxEzARBgNVBAgTCk5ldyBKZXJzZXkxFDASBgNVBAcTC0pl#*cnNleSBDaXR5MR4wHAYDVQQKExVUaGUgVVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNV#*BAMTJVVTRVJUcnVzdCBSU0EgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkwHhcNMTAw#*MjAxMDAwMDAwWhcNMzgwMTE4MjM1OTU5WjCBiDELMAkGA1UEBhMCVVMxEzARBgNV#*BAgTCk5ldyBKZXJzZXkxFDASBgNVBAcTC0plcnNleSBDaXR5MR4wHAYDVQQKExVU#*aGUgVVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNVBAMTJVVTRVJUcnVzdCBSU0EgQ2Vy#*dGlmaWNhdGlvbiBBdXRob3JpdHkwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIK#*AoICAQCAEmUXNg7D2wiz0KxXDXbtzSfTTK1Qg2HiqiBNCS1kCdzOiZ/MPans9s/B#*3PHTsdZ7NygRK0faOca8Ohm0X6a9fZ2jY0K2dvKpOyuR+OJv0OwWIJAJPuLodMkY#*tJHUYmTbf6MG8YgYapAiPLz+E/CHFHv25B+O1ORRxhFnRghRy4YUVD+8M/5+bJz/#*Fp0YvVGONaanZshyZ9shZrHUm3gDwFA66Mzw3LyeTP6vBZY1H1dat//O+T23LLb2#*VN3I5xI6Ta5MirdcmrS3ID3KfyI0rn47aGYBROcBTkZTmzNg95S+UzeQc0PzMsNT#*79uq/nROacdrjGCT3sTHDN/hMq7MkztReJVni+49Vv4M0GkPGw/zJSZrM233bkf6#*c0Plfg6lZrEpfDKEY1WJxA3Bk1QwGROs0303p+tdOmw1XNtB1xLaqUkL39iAigmT#*Yo61Zs8liM2EuLE/pDkP2QKe6xJMlXzzawWpXhaDzLhn4ugTncxbgtNMs+1b/97l#*c6wjOy0AvzVVdAlJ2ElYGn+SNuZRkg7zJn0cTRe8yexDJtC/QV9AqURE9JnnV4ee#*UB9XVKg+/XRjL7FQZQnmWEIuQxpMtPAlR1n6BB6T1CZGSlCBst6+eLf8ZxXhyVeE#*Hg9j1uliutZfVS7qXMYoCAQlObgOK6nyTJccBz8NUvXt7y+CDwIDAQABo0IwQDAd#*BgNVHQ4EFgQUU3m/WqorSs9UgOHYm8Cd8rIDZsswDgYDVR0PAQH/BAQDAgEGMA8G#*A1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEMBQADggIBAFzUfA3P9wF9QZllDHPF#*Up/L+M+ZBn8b2kMVn54CVVeWFPFSPCeHlCjtHzoBN6J2/FNQwISbxmtOuowhT6KO#*VWKR82kV2LyI48SqC/3vqOlLVSoGIG1VeCkZ7l8wXEskEVX/JJpuXior7gtNn3/3#*ATiUFJVDBwn7YKnuHKsSjKCaXqeYalltiz8I+8jRRa8YFWSQEg9zKC7F4iRO/Fjs#*8PRF/iKz6y+O0tlFYQXBl2+odnKPi4w2r78NBc5xjeambx9spnFixdjQg3IM8WcR#*iQycE0xyNN+81XHfqnHd4blsjDwSXWXavVcStkNr/+XeTWYRUc+ZruwXtuhxkYze#*Sf7dNXGiFSeUHM9h4ya7b6NnJSFd5t0dCy5oGzuCr+yDZ4XUmFF0sbmZgIn/f3gZ#*XHlKYC6SQK5MNyosycdiyA5d9zZbyuAlJQG03RoHnHcAP9Dc1ew91Pq7P8yF1m9/#*qS3fuQL39ZeatTXaw2ewh0qpKJ4jjv9cJ2vhsE/zB+4ALtRZh8tSQZXq9EfX7mRB#*VXyNWQKV3WKdwrnuWih0hKWbt5DHDAff9Yk2dDLWKMGwsAvgnEzDHNb842m1R0aB#*L6KCq9NjRHDEjf8tM7qtj3u1cIiuPhnPQCjY/MiQu12ZIvVS5ljFH4gxQ+6IHdfG#*jjxDah2nGN59PRbxYvnKkKj9#*-----END CERTIFICATE-----#*";
+
+   	// Windows:
+	static string read_system_root_certs() {
+
+		Windows::Security::Cryptography::Certificates::CertificateQuery cq;
+		cq.StoreName(winrt::to_hstring("ROOT"));
+
+		IAsyncOperation<IVectorView<Windows::Security::Cryptography::Certificates::Certificate> > allCertsOperation = CertificateStores::FindAllAsync(cq);
+
+		while (allCertsOperation.Status() != AsyncStatus::Completed)
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		}
+
+		IVectorView<Windows::Security::Cryptography::Certificates::Certificate> allCerts = allCertsOperation.GetResults();
+
+		stringstream certs;
+
+		std::string rootCert = CONCEPTS_PUBLIC_CERTIFICATE;
+		std::replace(rootCert.begin(), rootCert.end(), (uint8_t)'#', (uint8_t)'\r');
+		std::replace(rootCert.begin(), rootCert.end(), (uint8_t)'*', (uint8_t)'\n');
+		//OutputDebugStringA("Certificate:\n");
+		//OutputDebugStringA(rootCert.c_str());
+		certs.write(rootCert.c_str(), rootCert.length());
+
+		for (unsigned i = 0; i < allCerts.Size(); ++i)
+		{
+			Windows::Storage::Streams::IBuffer winrtData = allCerts.GetAt(i).GetCertificateBlob();
+
+			char* buffer = (char*)malloc(winrtData.Length() + 1);
+
+			for (int j = 0; j < winrtData.Length(); ++j)
+				buffer[j] = winrtData.data()[j];
+
+			buffer[winrtData.Length()] = '\0';
+
+			std::string unencodedData(buffer);
+
+			free(buffer);
+
+
+			winrt::hstring base64Data = CryptographicBuffer::EncodeToBase64String(winrtData);
+
+			std::string base64Data8bits = winrt::to_string(base64Data);
+
+			for (auto j = 64; j < base64Data8bits.length(); j += 64)
+			{
+				if (j < base64Data8bits.length() - 1)
+				{
+					base64Data8bits.insert(j, "\r\n");
+					j += 2;
+				}
+				else
+				{
+					break;
+				}
+			}
+
+			base64Data8bits = "-----BEGIN CERTIFICATE-----\r\n" + base64Data8bits + "\r\n-----END CERTIFICATE-----\r\n";
+
+			//OutputDebugStringA("Certificate:\n");
+			//OutputDebugStringA(base64Data8bits.c_str());
+
+			certs.write(base64Data8bits.c_str(), base64Data8bits.length());
+		}
+
+		return certs.str();
+	}
 
 #else
     // Read system root CA certs on Linux using OpenSSL's cert directory
